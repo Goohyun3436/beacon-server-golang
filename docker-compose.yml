@@ -1,0 +1,10 @@
+version: "3.8"
+
+services:
+  beacon-server:
+    build:
+      context: ./beacon
+    container_name: beacon
+    restart: always
+    ports:
+      - "7001:7001"
