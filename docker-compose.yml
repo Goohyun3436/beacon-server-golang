@@ -1,10 +1,24 @@
 version: "3.8"
 
 services:
-  beacon-server:
+  beacon:
+    depends_on:
+      - influxdb2
     build:
       context: ./beacon
     container_name: beacon
     restart: always
     ports:
       - "7001:7001"
+
+  influxdb2:
+    image: influxdb:2.7
+    container_name: influxdb2
+    restart: always
+    ports:
+      - "8086:8086"
+    volumes:
+      - ./influxdb2/data:/var/lib/influxdb2
+      - ./influxdb2/config:/etc/influxdb2
+    env_file:
+      - ./influxdb2/influxdb2.env

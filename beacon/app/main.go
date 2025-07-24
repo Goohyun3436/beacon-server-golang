@@ -5,60 +5,53 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxdb2api "github.com/influxdata/influxdb-client-go/v2/api"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+const (
+	PORT              = ":7001"
+	BATCH_FLUSH_COUNT = 10
+	BATCH_FLUSH_TIME  = 10 * time.Second
+
+	influxURL = "http://influxdb2:8086"
+	token     = "2bq9r-S3qb3e-ter4-w2kid"
+	org       = "beacon"
+	bucketBcn = "beacon"
+
+	prefix    = "00:C0:B1"
 )
 
 type BeaconData struct {
 	HygateMAC string
 	BeaconMAC string
 	RSSI      int
-	Timestamp int64
+	Timestamp time.Time
 	RemoteIP  string
 }
 
-type OwnerInfo struct {
-	HygateMAC string
-	RSSI      int
-	Timestamp int64
-}
-
 var (
-	VALID_HYGATE_MACS = map[string]bool{}
-	VALID_BEACON_MACS = map[string]bool{}
-	UNREGISTERED_MACS = map[string]bool{}
-
-	beaconOwnerMap = make(map[string]OwnerInfo)
-	ownerLock      = sync.Mutex{}
-
-	// DB clients
-	mongoClient    *mongo.Client
-	influxClient   influxdb2.Client
-	influxWriteAPI influxdb2api.WriteAPIBlocking
+	influxClient      influxdb2.Client
+	influxWriteBeacon influxdb2api.WriteAPIBlocking
+	influxQueue       = make(chan BeaconData, 500)
 )
 
 func main() {
-	initMongo()
 	initInflux()
-	initValidMACsFromMongo()
-	
-	listener, err := net.Listen("tcp", ":7001")
+	go influxWorker()
+
+	ln, err := net.Listen("tcp", PORT)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("[TCP SERVER] Listening on port 7001")
+	fmt.Println("✅ TCP Server listening on", PORT)
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("[ERROR] Accept:", err)
 			continue
 		}
 		go handleConnection(conn)
@@ -72,41 +65,73 @@ func handleConnection(conn net.Conn) {
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
-		raw := scanner.Text()
-		parts := strings.Split(raw, ",")
+		line := scanner.Text()
+
+		fmt.Printf("[RAWDATA] %s\n", line)
+
+		if strings.HasPrefix(line, "PROXY") {
+			parts := strings.Split(line, " ")
+			if len(parts) >= 3 {
+				clientIP = parts[2]
+			}
+			continue
+		}
+
+		parts := strings.Split(line, ",")
 		if len(parts) != 5 {
 			continue
 		}
-		beaconRaw := parts[1]
-		rssi := parts[2]
-		hygateRaw := parts[4]
 
-		beaconMAC, err1 := formatMAC(beaconRaw)
-		hygateMAC, err2 := formatMAC(hygateRaw)
+		bmac, err1 := formatMAC(parts[1])
+		hmac, err2 := formatMAC(parts[4])
+		rssi := parseRSSI(parts[2])
 		if err1 != nil || err2 != nil {
 			continue
 		}
 
-		if !isValidHygate(hygateMAC, clientIP) || !isValidBeacon(beaconMAC) {
-			continue
+		if !strings.HasPrefix(bmac, prefix) {
+			continue // prefix filter
 		}
 
-		rssiVal := parseRSSI(rssi)
-		data := BeaconData{
-			HygateMAC: hygateMAC,
-			BeaconMAC: beaconMAC,
-			RSSI:      rssiVal,
-			Timestamp: time.Now().UnixNano(),
-			RemoteIP:  clientIP,
-		}
+		data := BeaconData{hmac, bmac, rssi, time.Now(), clientIP}
+		influxQueue <- data
+	}
+}
 
-		if isOwner(data) {
-			fmt.Printf("[SAVE] %s -> %s (%d)\n", hygateMAC, beaconMAC, rssiVal)
-			saveToInflux(data)
+func influxWorker() {
+	batch := []BeaconData{}
+	ticker := time.NewTicker(BATCH_FLUSH_TIME)
+	for {
+		select {
+		case data := <-influxQueue:
+			batch = append(batch, data)
+			if len(batch) >= BATCH_FLUSH_COUNT {
+				flushBeacon(batch)
+				batch = []BeaconData{}
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				flushBeacon(batch)
+				batch = []BeaconData{}
+			}
 		}
 	}
+}
 
-	fmt.Printf("[DISCONNECTED] %s\n", clientIP)
+func flushBeacon(batch []BeaconData) {
+	for _, d := range batch {
+		p := influxdb2.NewPointWithMeasurement("mem").
+			AddTag("hygate_mac", d.HygateMAC).
+			AddTag("ip", d.RemoteIP).
+			AddTag("mac", d.BeaconMAC).
+			AddField("rssi", d.RSSI).
+			SetTime(d.Timestamp)
+
+		err := influxWriteBeacon.WritePoint(context.Background(), p)
+		if err != nil {
+			fmt.Println("❌ Influx write error:", err)
+		}
+	}
 }
 
 func formatMAC(raw string) (string, error) {
@@ -116,155 +141,21 @@ func formatMAC(raw string) (string, error) {
 	if len(raw) != 12 {
 		return "", fmt.Errorf("invalid MAC length")
 	}
-	var formatted strings.Builder
+	parts := []string{}
 	for i := 0; i < 12; i += 2 {
-		formatted.WriteString(raw[i : i+2])
-		if i < 10 {
-			formatted.WriteString(":")
-		}
+		parts = append(parts, raw[i:i+2])
 	}
-	return formatted.String(), nil
+	return strings.ToUpper(strings.Join(parts, ":")), nil
 }
 
-func parseRSSI(s string) int {
-	var v int
-	fmt.Sscanf(s, "%d", &v)
-	return v
-}
-
-func isValidHygate(mac string, ip string) bool {
-	if VALID_HYGATE_MACS[mac] {
-		return true
-	}
-	if UNREGISTERED_MACS[mac] {
-		return false
-	}
-
-	fmt.Printf("[UNREGISTERED HYGATE] %s from IP %s\n", mac, ip)
-	UNREGISTERED_MACS[mac] = true
-	return false
-}
-
-func isValidBeacon(mac string) bool {
-	if VALID_BEACON_MACS[mac] {
-		return true
-	}
-	if UNREGISTERED_MACS[mac] {
-		return false
-	}
-	UNREGISTERED_MACS[mac] = true
-	return false
-}
-
-func isOwner(data BeaconData) bool {
-	now := time.Now().Unix()
-	ownerLock.Lock()
-	defer ownerLock.Unlock()
-
-	info, exists := beaconOwnerMap[data.BeaconMAC]
-
-	if !exists || now-info.Timestamp > 10 {
-		beaconOwnerMap[data.BeaconMAC] = OwnerInfo{data.HygateMAC, data.RSSI, now}
-		return true
-	}
-
-	if data.RSSI > info.RSSI || info.HygateMAC == data.HygateMAC {
-		beaconOwnerMap[data.BeaconMAC] = OwnerInfo{data.HygateMAC, data.RSSI, now}
-		return true
-	}
-	return false
-}
-
-func saveToInflux(data BeaconData) {
-	point := influxdb2.NewPointWithMeasurement("mem").
-		AddTag("hygate_mac", data.HygateMAC).
-		AddTag("ip", data.RemoteIP).
-		AddTag("mac", data.BeaconMAC).
-		AddField("rssi", data.RSSI).
-		SetTime(time.Unix(0, data.Timestamp))
-
-	err := influxWriteAPI.WritePoint(context.Background(), point)
-	if err != nil {
-		fmt.Printf("[INFLUX ERROR] %v\n", err)
-	}
-}
-
-func initMongo() {
-	var err error
-	uri := "mongodb://smhanduck:hd123@test-mongodb:27017"
-
-	mongoClient, err = mongo.Connect(context.Background(), options.Client().ApplyURI(uri))
-	if err != nil {
-		fmt.Println("❌ MongoDB Connection Failed (connect):", err)
-		os.Exit(1)
-	}
-
-	err = mongoClient.Ping(context.Background(), nil)
-	if err != nil {
-		fmt.Println("❌ MongoDB Connection Failed (ping):", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("✅ MongoDB Connected")
+func parseRSSI(r string) int {
+	var val int
+	fmt.Sscanf(r, "%d", &val)
+	return val
 }
 
 func initInflux() {
-	url := "http://test-influxdb2:8086"
-	token := "2bq9r-S3qb3e-ter4-w2kid"
-	org := "smhanduck"
-
-	influxClient = influxdb2.NewClient(url, token)
-	influxWriteAPI = influxClient.WriteAPIBlocking(org, "smhanduck_beacon")
-
-	health, err := influxClient.Health(context.Background())
-	if err != nil || health.Status != "pass" {
-		fmt.Println("❌ InfluxDB Connection Failed:", err)
-		os.Exit(1)
-	}
+	influxClient = influxdb2.NewClient(influxURL, token)
+	influxWriteBeacon = influxClient.WriteAPIBlocking(org, bucketBcn)
 	fmt.Println("✅ InfluxDB Connected")
-}
-
-func initValidMACsFromMongo() {
-	ctx := context.Background()
-	db := mongoClient.Database("SMHANDUCK")
-
-	collections := []string{"vehicle", "worker", "heartbit", "scanner"}
-	for _, col := range collections {
-		cursor, err := db.Collection(col).Find(ctx, map[string]any{})
-		if err != nil {
-			fmt.Printf("⚠️ Mongo Find Error: %s\n", col)
-			continue
-		}
-		for cursor.Next(ctx) {
-			var doc struct {
-				MAC string `bson:"mac"`
-			}
-			if err := cursor.Decode(&doc); err == nil && doc.MAC != "" {
-				if col == "scanner" {
-					VALID_HYGATE_MACS[doc.MAC] = true
-				} else {
-					VALID_BEACON_MACS[doc.MAC] = true
-				}
-			}
-		}
-		cursor.Close(ctx)
-	}
-
-	// Load unregistered MACs
-	cursor, err := db.Collection("unregisteredDevice").Find(ctx, map[string]any{})
-	if err != nil {
-		fmt.Println("⚠️ Mongo Find Error: unregisteredDevice")
-		return
-	}
-	for cursor.Next(ctx) {
-		var doc struct {
-			MAC string `bson:"mac"`
-		}
-		if err := cursor.Decode(&doc); err == nil && doc.MAC != "" {
-			UNREGISTERED_MACS[doc.MAC] = true
-		}
-	}
-	cursor.Close(ctx)
-
-	fmt.Printf("Loaded %d HYGATE, %d BEACON, %d UNREGISTERED MACs\n", len(VALID_HYGATE_MACS), len(VALID_BEACON_MACS), len(UNREGISTERED_MACS))
 }
